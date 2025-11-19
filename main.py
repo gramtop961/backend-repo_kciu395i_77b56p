@@ -1,8 +1,28 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any, Dict
+from datetime import datetime
 
-app = FastAPI()
+from database import db, create_document, get_documents
+from schemas import PitchDeck, Slide
+
+# Helper to convert MongoDB documents to JSON-serializable dicts
+from bson import ObjectId
+
+def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    for k, v in doc.items():
+        if isinstance(v, ObjectId):
+            out[k] = str(v)
+        elif isinstance(v, datetime):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+app = FastAPI(title="Pitchdeck Maker API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,7 +34,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "Pitchdeck Maker API is running"}
 
 @app.get("/api/hello")
 def hello():
@@ -22,7 +42,6 @@ def hello():
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
@@ -31,39 +50,145 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
+            response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
             response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
     return response
 
+# ---------------- Pitchdeck Maker Endpoints ----------------
+class DeckRequest(BaseModel):
+    name: str = Field(..., description="Company or product name")
+    industry: Optional[str] = Field(None, description="Industry or category")
+    audience: Optional[str] = Field(None, description="Audience, e.g., seed investors")
+    tone: Optional[str] = Field("concise", description="Tone of writing")
+    problem: Optional[str] = Field(None, description="Problem statement")
+    solution: Optional[str] = Field(None, description="Solution summary")
+    market: Optional[str] = Field(None, description="Target market size/segment")
+    traction: Optional[str] = Field(None, description="Key traction metrics or proof points")
+
+
+def generate_default_slides(payload: DeckRequest) -> List[Slide]:
+    name = payload.name
+    industry = payload.industry or ""
+    audience = payload.audience or "investors"
+    tone = payload.tone or "concise"
+
+    slides: List[Slide] = []
+
+    slides.append(Slide(
+        title=f"{name}",
+        content=f"A {industry} company. A {tone} overview for {audience}.",
+        bullets=["Vision: Build something people love", "Model: Efficient, scalable, defensible"],
+        kind="title"
+    ))
+
+    if payload.problem:
+        slides.append(Slide(
+            title="Problem",
+            content=payload.problem,
+            bullets=["Pain is frequent", "Costly and widespread", "Current solutions are clunky"],
+            kind="problem"
+        ))
+
+    slides.append(Slide(
+        title="Solution",
+        content=payload.solution or f"{name} delivers a modern, streamlined experience.",
+        bullets=["Simple to adopt", "Delightful UX", "10x better on key metrics"],
+        kind="solution"
+    ))
+
+    if payload.market:
+        slides.append(Slide(
+            title="Market",
+            content=payload.market,
+            bullets=["Large and expanding", "Well-defined ICP", "Clear wedge to enter"],
+            kind="market"
+        ))
+
+    slides.append(Slide(
+        title="Product",
+        content="Key capabilities and differentiators.",
+        bullets=["Core features", "Differentiation", "Roadmap highlights"],
+        kind="product"
+    ))
+
+    slides.append(Slide(
+        title="Business Model",
+        content="How we make money.",
+        bullets=["Pricing strategy", "Unit economics", "Go-to-market"],
+        kind="business"
+    ))
+
+    if payload.traction:
+        slides.append(Slide(
+            title="Traction",
+            content=payload.traction,
+            bullets=["Growth", "Retention", "Pipeline"],
+            kind="traction"
+        ))
+
+    slides.append(Slide(
+        title="Team",
+        content="Who we are and why us.",
+        bullets=["Founders", "Relevant experience", "Advisors"],
+        kind="team"
+    ))
+
+    slides.append(Slide(
+        title="Ask",
+        content="Funding and use of proceeds.",
+        bullets=["Round size", "Use of funds", "Milestones"],
+        kind="ask"
+    ))
+
+    return slides
+
+@app.post("/api/decks")
+def create_deck(req: DeckRequest):
+    deck = PitchDeck(
+        name=req.name,
+        industry=req.industry,
+        audience=req.audience,
+        tone=req.tone,
+        slides=generate_default_slides(req)
+    )
+    try:
+        deck_id = create_document("pitchdeck", deck)
+        doc = db["pitchdeck"].find_one({"_id": ObjectId(deck_id)})
+        return {"deck": serialize_doc(doc)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/decks")
+def list_decks(limit: int = 20):
+    try:
+        docs = get_documents("pitchdeck", {}, limit=limit)
+        return {"decks": [serialize_doc(d) for d in docs]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/decks/{deck_id}")
+def get_deck(deck_id: str):
+    try:
+        doc = db["pitchdeck"].find_one({"_id": ObjectId(deck_id)})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Deck not found")
+        return {"deck": serialize_doc(doc)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
